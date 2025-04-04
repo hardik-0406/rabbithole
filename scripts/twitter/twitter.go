@@ -1,5 +1,5 @@
 // main.go
-package rabbithole
+package main
 
 import (
 	"encoding/json"
@@ -8,17 +8,64 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"rabbithole"
+	"rabbithole/db"
+	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-// Add rate limit tracking
+// Add a config struct
+type TwitterConfig struct {
+	APIKey       string
+	APIKeySecret string
+	BearerToken  string
+	AccessToken  string
+}
+
+// Add more sophisticated rate limit tracking
 var (
-	lastRequestTime time.Time
-	minRequestGap   = 3 * time.Second // Minimum time between requests
+	lastRequestTime     time.Time
+	minRequestGap       = 5 * time.Second // Increased from 3s to 5s
+	requestCount        = 0
+	maxRequestsPer15Min = 450 // Twitter's standard rate limit
+	windowStart         = time.Now()
+	mu                  sync.Mutex // Mutex for thread-safe rate limit tracking
 )
+
+// Add a rate limit checker function
+func checkRateLimit() time.Duration {
+	mu.Lock()
+	defer mu.Unlock()
+
+	now := time.Now()
+
+	// Reset window if 15 minutes have passed
+	if now.Sub(windowStart) > 15*time.Minute {
+		windowStart = now
+		requestCount = 0
+	}
+
+	// Check if we're approaching rate limit
+	if requestCount >= maxRequestsPer15Min {
+		// Wait until the current window expires
+		return time.Until(windowStart.Add(15 * time.Minute))
+	}
+
+	// Check minimum gap between requests
+	timeSinceLastRequest := time.Since(lastRequestTime)
+	if timeSinceLastRequest < minRequestGap {
+		return minRequestGap - timeSinceLastRequest
+	}
+
+	return 0
+}
 
 // Tweet model for GORM
 type Tweet struct {
@@ -27,6 +74,11 @@ type Tweet struct {
 	Username  string    `gorm:"index"`
 	Text      string    `gorm:"type:text"`
 	CreatedAt time.Time `gorm:"index"`
+}
+
+// Add TableName method to specify custom table name
+func (Tweet) TableName() string {
+	return "tweets_v2"
 }
 
 // TwitterResponse structure for API response
@@ -54,11 +106,12 @@ func FetchTweetsForHandle(db *gorm.DB, handle string, start, end time.Time) erro
 	log.Printf("🚀 Starting tweet fetch for @%s", handle)
 	log.Printf("📅 Time range: %s to %s", start.Format("2006-01-02 15:04:05"), end.Format("2006-01-02 15:04:05"))
 
-	maxPages := 10 // Reduced from 100 to avoid hitting rate limits
+	maxPages := 5 // Reduced from 10 to 5 to be more conservative
 	nextToken := ""
 	totalTweets := 0
 	retryCount := 0
 	maxRetries := 3
+	pageDelay := 10 * time.Second // Increased from 5s to 10s
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -93,9 +146,9 @@ func FetchTweetsForHandle(db *gorm.DB, handle string, start, end time.Time) erro
 		}
 		nextToken = token
 
-		// Add delay between pages
+		// Add longer delay between pages
 		log.Printf("😴 Waiting between pages...")
-		time.Sleep(5 * time.Second)
+		time.Sleep(pageDelay)
 	}
 
 	log.Printf("✅ Completed fetching tweets for @%s. Total tweets: %d", handle, totalTweets)
@@ -103,13 +156,16 @@ func FetchTweetsForHandle(db *gorm.DB, handle string, start, end time.Time) erro
 }
 
 func fetchTweetPage(client *http.Client, handle string, start, end time.Time, nextToken string) ([]Tweet, string, error) {
-	// Respect rate limits
-	timeSinceLastRequest := time.Since(lastRequestTime)
-	if timeSinceLastRequest < minRequestGap {
-		sleepTime := minRequestGap - timeSinceLastRequest
-		log.Printf("⏳ Rate limiting: Waiting %v before next request...", sleepTime.Round(time.Second))
-		time.Sleep(sleepTime)
+	// Check rate limits
+	if waitTime := checkRateLimit(); waitTime > 0 {
+		log.Printf("⏳ Rate limiting: Waiting %v before next request...", waitTime.Round(time.Second))
+		time.Sleep(waitTime)
 	}
+
+	mu.Lock()
+	requestCount++
+	lastRequestTime = time.Now()
+	mu.Unlock()
 
 	log.Printf("🔍 Preparing API request for @%s", handle)
 
@@ -153,10 +209,7 @@ func fetchTweetPage(client *http.Client, handle string, start, end time.Time, ne
 		return nil, "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", Twitter_bearer_token))
-
-	// Track request time for rate limiting
-	lastRequestTime = time.Now()
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", rabbithole.Twitter_bearer_token))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -171,15 +224,22 @@ func fetchTweetPage(client *http.Client, handle string, start, end time.Time, ne
 
 	// Handle rate limiting
 	if resp.StatusCode == 429 {
+		mu.Lock()
+		// Reset request count and increase wait time
+		requestCount = maxRequestsPer15Min // Force a window reset
+		mu.Unlock()
+
 		retryAfter := resp.Header.Get("Retry-After")
+		waitTime := 30 * time.Second // default to 30 seconds
 		if retryAfter != "" {
-			seconds := 30 // default to 30 seconds if header not present
-			fmt.Sscanf(retryAfter, "%d", &seconds)
-			log.Printf("⏳ Rate limited. Waiting %d seconds before retry...", seconds)
-			time.Sleep(time.Duration(seconds) * time.Second)
-			return fetchTweetPage(client, handle, start, end, nextToken) // Retry the request
+			if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				waitTime = time.Duration(seconds) * time.Second
+			}
 		}
-		return nil, "", fmt.Errorf("rate limited: %s", string(body))
+
+		log.Printf("⏳ Rate limited. Waiting %v before retry...", waitTime)
+		time.Sleep(waitTime)
+		return fetchTweetPage(client, handle, start, end, nextToken)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -244,4 +304,72 @@ func storeTweets(db *gorm.DB, tweets []Tweet) error {
 
 	log.Printf("✅ Successfully stored tweets in database (Rows affected: %d)", result.RowsAffected)
 	return nil
+}
+
+// FetchTweetsForHandles fetches tweets for multiple Twitter handles
+func FetchTweetsForHandles(db *gorm.DB, handles []string, start, end time.Time) error {
+	handleDelay := 30 * time.Second // Increased from 10s to 30s
+
+	for _, handle := range handles {
+		if err := FetchTweetsForHandle(db, handle, start, end); err != nil {
+			log.Printf("❌ Error fetching tweets for @%s: %v", handle, err)
+			// Add longer delay after error
+			time.Sleep(handleDelay * 2)
+			continue
+		}
+		// Add longer delay between handles
+		log.Printf("😴 Waiting between handles...")
+		time.Sleep(handleDelay)
+	}
+	return nil
+}
+
+func main() {
+	// Set up logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("🚀 Starting Twitter fetcher service")
+
+	db, err := db.InitDB()
+	if err != nil {
+		log.Fatalf("❌ Failed to initialize database: %v", err)
+	}
+
+	// Auto migrate the Tweet model - this will create tweets_v2 table
+	log.Println("🔄 Creating/updating tweets_v2 table...")
+	if err := db.AutoMigrate(&Tweet{}); err != nil {
+		log.Fatalf("❌ Failed to migrate database: %v", err)
+	}
+	log.Println("✅ Database migration completed")
+
+	// Define CRED handles to fetch
+	handles := []string{"CRED_club", "Cred_support"}
+
+	// Calculate time range (last 7 days, as per Twitter API limitation)
+	end := time.Now()
+	start := end.AddDate(0, 0, -7)
+
+	// Create a channel for error handling
+	errChan := make(chan error, 1)
+
+	// Start tweet fetching in a goroutine
+	go func() {
+		err := FetchTweetsForHandles(db, handles, start, end)
+		errChan <- err
+	}()
+
+	// Handle program termination
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for either completion or interruption
+	select {
+	case err := <-errChan:
+		if err != nil {
+			log.Printf("❌ Error occurred while fetching tweets: %v", err)
+		} else {
+			log.Println("✅ Successfully completed fetching tweets")
+		}
+	case sig := <-sigChan:
+		log.Printf("📡 Received signal %v, shutting down...", sig)
+	}
 }

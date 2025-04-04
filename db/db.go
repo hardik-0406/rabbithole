@@ -57,12 +57,12 @@ func InitDB() (*gorm.DB, error) {
 	sqlDB.SetConnMaxLifetime(time.Hour)
 	log.Println("✅ Connection pool configured")
 
-	log.Println("🔄 Running database migrations...")
-	if err := DB.AutoMigrate(&rabbithole.Tweet{}); err != nil {
-		log.Printf("❌ Migration failed: %v", err)
-		return nil, fmt.Errorf("failed to migrate database: %w", err)
-	}
-	log.Println("✅ Database migrations completed successfully")
+	// log.Println("🔄 Running database migrations...")
+	// if err := DB.AutoMigrate(&rabbithole.Tweet{}); err != nil {
+	// 	log.Printf("❌ Migration failed: %v", err)
+	// 	return nil, fmt.Errorf("failed to migrate database: %w", err)
+	// }
+	// log.Println("✅ Database migrations completed successfully")
 
 	return DB, nil
 }

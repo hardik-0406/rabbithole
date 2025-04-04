@@ -63,7 +63,7 @@ const (
 	chatAPI    = "https://api.rabbithole.cred.club/v1/chat/completions"
 	apiKey     = "sk-G_BXXmoaRnY5pkImc2yjDw"
 	embedModel = "text-embedding-3-small"
-	chatModel  = "claude-3-5-sonnet"
+	chatModel  = "claude-3-7-sonnet"
 )
 
 func main() {
