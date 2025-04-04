@@ -1,4 +1,4 @@
-module github.com/hardik-0406/rabbithole
+module rabbithole
 
 go 1.21.13
 

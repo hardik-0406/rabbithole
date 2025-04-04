@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hardik-0406/rabbithole/rabbithole"
+	"rabbithole"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -13,8 +13,8 @@ var DB *gorm.DB
 
 func main() {
 	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=Asia/Kolkata",
-		rabbithole.db_host, rabbithole.db_user, rabbithole.db_pass, rabbithole.db_name, rabbithole.db_port,
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=prefer",
+		rabbithole.DB_host, rabbithole.DB_user, rabbithole.DB_pass, rabbithole.DB_name, rabbithole.DB_port,
 	)
 
 	var err error
@@ -24,6 +24,6 @@ func main() {
 	}
 
 	// Auto-migrate your Tweet model
-	DB.AutoMigrate(&Tweet{})
+	DB.AutoMigrate(&rabbithole.Tweet{})
 	log.Println("✅ Connected to PostgreSQL and migrated Tweet table.")
 }
