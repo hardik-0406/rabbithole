@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"sort"
@@ -171,85 +170,6 @@ func (s *FeedbackService) GetTopFeedback(lob, category, subCategory string) (*Fe
 	}, nil
 }
 
-func (s *FeedbackService) categorizeFeedbackWithLLM(feedback string) (string, error) {
-	// Acquire rate limit token
-	s.rateLimiter <- struct{}{}
-	defer func() { <-s.rateLimiter }()
-
-	prompt := fmt.Sprintf(`You are a classification assistant.
-
-Your task is to classify the given user feedback into one of the following insight types:
-- complaint: If the user is reporting a problem or expressing frustration.
-- improvement: If the user suggests enhancing something that exists.
-- feature-request: If the user is asking for a new feature or functionality.
-
-Context:
-Feedback: "%s"
-
-Respond with exactly one of the 3 options: complaint, improvement, or feature-request. Do not include anything else.`, feedback)
-
-	data := map[string]interface{}{
-		"model": chatModel,
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-	}
-	body, err := json.Marshal(data)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", chatAPI, bytes.NewBuffer(body))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("API request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Handle non-200 status codes
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no classification result")
-	}
-
-	// Validate the response is one of the expected values
-	response := strings.TrimSpace(strings.ToLower(result.Choices[0].Message.Content))
-	validResponses := map[string]bool{
-		"complaint":       true,
-		"improvement":     true,
-		"feature-request": true,
-	}
-
-	if !validResponses[response] {
-		return "", fmt.Errorf("invalid classification: %s", response)
-	}
-
-	return response, nil
-}
-
 func getTop5(items []FeedbackItem) []FeedbackItem {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].Score > items[j].Score
@@ -259,98 +179,6 @@ func getTop5(items []FeedbackItem) []FeedbackItem {
 		return items[:5]
 	}
 	return items
-}
-
-func (s *FeedbackService) summarizeWithLLM(feedbacks []string, insightType string) (string, error) {
-	var prompt string
-	switch insightType {
-	case "feature requests":
-		prompt = fmt.Sprintf(`You are a product insights analyst.
-Task: Analyze these user feedback items and extract specific feature requests.
-Feedback items:
-%s
-
-Format your response as a simple bullet-point list of unique, specific features requested.
-Each bullet point should be a clear, concise feature description.
-Do not include any analysis, headers, or additional commentary.
-Example format:
-- Feature description 1
-- Feature description 2`, strings.Join(feedbacks, "\n"))
-
-	case "improvements":
-		prompt = fmt.Sprintf(`You are a product insights analyst.
-Task: Analyze these user feedback items about potential improvements.
-Feedback items:
-%s
-
-Provide a 2-3 sentence summary focusing ONLY on:
-1. What specific aspects users want improved
-2. Why these improvements matter to users
-
-Be concise and specific. Do not include any analysis headers or bullet points.`, strings.Join(feedbacks, "\n"))
-
-	case "complaints":
-		prompt = fmt.Sprintf(`You are a product insights analyst.
-Task: Analyze these user complaints and identify core issues.
-Feedback items:
-%s
-
-Provide a 2-3 sentence summary focusing ONLY on:
-1. The main problems users are experiencing
-2. Any specific error patterns or technical issues mentioned
-
-Be concise and specific. Do not include any analysis headers or bullet points.`, strings.Join(feedbacks, "\n"))
-	}
-
-	// Use the existing LLM call mechanism but modify for summarization
-	data := map[string]interface{}{
-		"model": chatModel,
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-	}
-	body, err := json.Marshal(data)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", chatAPI, bytes.NewBuffer(body))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("API request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Handle non-200 status codes
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no classification result")
-	}
-
-	return strings.TrimSpace(result.Choices[0].Message.Content), nil
 }
 
 type insightTask struct {
