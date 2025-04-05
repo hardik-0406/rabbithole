@@ -31,7 +31,7 @@ func InitDB() (*gorm.DB, error) {
 	)
 
 	config := &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
+		Logger: logger.Default.LogMode(logger.Error),
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
 		},

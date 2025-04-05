@@ -1,4 +1,4 @@
-package main
+package ticket_intelligence
 
 import (
 	"bytes"
@@ -8,15 +8,11 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"rabbithole/db"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
@@ -116,6 +112,11 @@ type LinearResponse struct {
 	Errors []struct {
 		Message string `json:"message"`
 	} `json:"errors,omitempty"`
+}
+
+type TicketIntelligenceResponse struct {
+	Tickets []TicketIntelligence `json:"tickets"`
+	Status  string               `json:"status"`
 }
 
 func NewLinearClient(apiKey string) *LinearClient {
@@ -713,83 +714,22 @@ func (s *FeedbackService) verifyFeedbackEmbeddings() error {
 	return nil
 }
 
-func main() {
-	// Initialize your database connection here
-	database, err := db.InitDB()
+func (s *FeedbackService) ProcessTickets(ctx context.Context) (*TicketIntelligenceResponse, error) {
+	log.Println("🔄 Starting ticket intelligence processing")
+
+	// Ensure embeddings are up to date
+	if err := s.verifyFeedbackEmbeddings(); err != nil {
+		return nil, fmt.Errorf("failed to verify embeddings: %w", err)
+	}
+
+	// Process tickets
+	tickets, err := s.ProcessTicketIntelligence()
 	if err != nil {
-		log.Fatal("Failed to initialize database:", err)
+		return nil, fmt.Errorf("failed to process tickets: %w", err)
 	}
 
-	// Get the underlying *sql.DB to close it properly
-	sqlDB, err := database.DB()
-	if err != nil {
-		log.Fatal("Failed to get underlying *sql.DB:", err)
-	}
-	defer sqlDB.Close()
-
-	// Initialize feedback service
-	feedbackService, err := NewFeedbackService(database)
-	if err != nil {
-		log.Fatal("Failed to create feedback service:", err)
-	}
-
-	// Initialize Gin router
-	r := gin.Default()
-
-	// Add the ticket intelligence endpoint
-	r.GET("/api/v1/ticket-intelligence", func(c *gin.Context) {
-		intelligence, err := feedbackService.ProcessTicketIntelligence()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, intelligence)
-	})
-
-	// Add the debug endpoint
-	r.GET("/api/v1/debug/embeddings", func(c *gin.Context) {
-		var stats struct {
-			TotalFeedbacks int64   `json:"totalFeedbacks"`
-			WithEmbeddings int64   `json:"withEmbeddings"`
-			Coverage       float64 `json:"coverage"`
-		}
-
-		// Get total feedbacks
-		feedbackService.db.Model(&FeedbackInsight{}).Count(&stats.TotalFeedbacks)
-		feedbackService.db.Model(&FeedbackEmbedding{}).Count(&stats.WithEmbeddings)
-
-		if stats.TotalFeedbacks > 0 {
-			stats.Coverage = float64(stats.WithEmbeddings) / float64(stats.TotalFeedbacks) * 100
-		}
-
-		c.JSON(http.StatusOK, stats)
-	})
-
-	// Create server with proper shutdown
-	srv := &http.Server{
-		Addr:    ":8080",
-		Handler: r,
-	}
-
-	// Graceful shutdown
-	go func() {
-		log.Printf("🚀 Server starting on http://localhost:8080")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("❌ Server failed to start: %v", err)
-		}
-	}()
-
-	// Wait for interrupt signal
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-
-	// Shutdown gracefully
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
-	}
-
-	log.Println("Server exiting")
+	return &TicketIntelligenceResponse{
+		Tickets: tickets,
+		Status:  "success",
+	}, nil
 }
