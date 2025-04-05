@@ -12,18 +12,21 @@ import (
 	"rabbithole/models"
 	"rabbithole/secrets"
 
+	"github.com/patrickmn/go-cache"
 	"gorm.io/gorm"
 )
 
 const (
-	chatAPI               = "https://api.rabbithole.cred.club/v1/chat/completions"
-	apiKey                = "sk-G_BXXmoaRnY5pkImc2yjDw"
-	chatModel             = "claude-3-7-sonnet"
-	maxConcurrentLLMCalls = 5
-	llmTimeout            = 15 * time.Second
-	maxFeedbacksPerBatch  = 10
-	maxBatchSize          = 10
-	minFeedbackForInsight = 3
+	chatAPI                = "https://api.rabbithole.cred.club/v1/chat/completions"
+	apiKey                 = "sk-G_BXXmoaRnY5pkImc2yjDw"
+	chatModel              = "claude-3-7-sonnet"
+	maxConcurrentLLMCalls  = 5
+	llmTimeout             = 15 * time.Second
+	maxFeedbacksPerBatch   = 10
+	maxBatchSize           = 10
+	minFeedbackForInsight  = 3
+	defaultCacheExpiration = 15 * time.Minute
+	cleanupInterval        = 30 * time.Minute
 )
 
 // Response types
@@ -117,6 +120,7 @@ type InsightsService struct {
 	db          *gorm.DB
 	rateLimiter chan struct{}
 	llm         *LLMClient
+	cache       *cache.Cache
 }
 
 func NewInsightsService(db *gorm.DB) (*InsightsService, error) {
@@ -128,11 +132,24 @@ func NewInsightsService(db *gorm.DB) (*InsightsService, error) {
 		db:          db,
 		rateLimiter: make(chan struct{}, maxConcurrentLLMCalls),
 		llm:         NewLLMClient(secrets.CHAT_API, secrets.API_KEY),
+		cache:       cache.New(defaultCacheExpiration, cleanupInterval),
 	}, nil
+}
+
+// Add cache key generator helper
+func generateCacheKey(params ...string) string {
+	return strings.Join(params, ":")
 }
 
 // GetTopFeedback returns top feedback items for a given LOB
 func (s *InsightsService) GetTopFeedback(ctx context.Context, lob, category, subCategory string) (*FeedbackResponse, error) {
+	cacheKey := generateCacheKey("topfeedback", lob, category, subCategory)
+
+	// Try to get from cache
+	if cached, found := s.cache.Get(cacheKey); found {
+		return cached.(*FeedbackResponse), nil
+	}
+
 	if lob == "" {
 		return nil, fmt.Errorf("lob is required")
 	}
@@ -199,18 +216,30 @@ func (s *InsightsService) GetTopFeedback(ctx context.Context, lob, category, sub
 		return nil, fmt.Errorf("error iterating over rows: %w", err)
 	}
 
-	return &FeedbackResponse{
+	response := &FeedbackResponse{
 		LOB:          lob,
 		Category:     category,
 		SubCategory:  subCategory,
 		FeatureReqs:  getTop5(featureReqs),
 		Improvements: getTop5(improvements),
 		Complaints:   getTop5(complaints),
-	}, nil
+	}
+
+	// Store in cache
+	s.cache.Set(cacheKey, response, cache.DefaultExpiration)
+
+	return response, nil
 }
 
 // GetTopInsights returns aggregated insights across all feedback
 func (s *InsightsService) GetTopInsights(ctx context.Context) (*InsightsResponse, error) {
+	cacheKey := "top_insights"
+
+	// Try to get from cache
+	if cached, found := s.cache.Get(cacheKey); found {
+		return cached.(*InsightsResponse), nil
+	}
+
 	response := &InsightsResponse{
 		FeatureRequests: struct {
 			TopLOBs       []CategoryInsight `json:"top_lobs"`
@@ -253,6 +282,9 @@ func (s *InsightsService) GetTopInsights(ctx context.Context) (*InsightsResponse
 			return nil, err
 		}
 	}
+
+	// Store in cache before returning
+	s.cache.Set(cacheKey, response, cache.DefaultExpiration)
 
 	return response, nil
 }
@@ -532,10 +564,11 @@ RESPONSE FORMAT:
 %s
 
 RESPONSE FORMAT:
-Write 2-3 plain sentences that:
-1. State what users want improved
-2. Explain the impact on user experience
-3. No formatting, no bullet points, no headers`, feedbackText)
+Summarize in bullet points:
+- Main improvements users want (1-2 points)
+- Impact on user experience (1-2 points)
+- Key metrics or numbers if applicable
+- No explanatory text, just concise points`, feedbackText)
 
 	case "complaint":
 		return fmt.Sprintf(`Analyze these user complaints:
@@ -543,11 +576,12 @@ Write 2-3 plain sentences that:
 %s
 
 RESPONSE FORMAT:
-Write 3-4 plain sentences that:
-1. State the main problems
-2. Include specific numbers or percentages
-3. Mention business impact
-4. No formatting, no bullet points, no headers`, feedbackText)
+Summarize in bullet points:
+- Main problems reported (1-2 points)
+- Specific numbers or percentages
+- Business impact metrics
+- User sentiment indicators
+- No explanatory text, just concise points`, feedbackText)
 	}
 	return ""
 }
@@ -716,6 +750,13 @@ func (s *InsightsService) processCategoryInsights(response *InsightsResponse) er
 
 // GenerateInsights creates insights for a specific LOB/category
 func (s *InsightsService) GenerateInsights(ctx context.Context, lob, category, folder string) (*InsightResponse, error) {
+	cacheKey := generateCacheKey("insights", lob, category, folder)
+
+	// Try to get from cache
+	if cached, found := s.cache.Get(cacheKey); found {
+		return cached.(*InsightResponse), nil
+	}
+
 	// 1. Get grouped feedback by type
 	feedbackGroups, err := s.getFeedbackGroups(lob, category, folder)
 	if err != nil {
@@ -784,13 +825,18 @@ func (s *InsightsService) GenerateInsights(ctx context.Context, lob, category, f
 		return nil, err
 	}
 
-	return &InsightResponse{
+	response := &InsightResponse{
 		LOB:      lob,
 		Category: category,
 		Folder:   folder,
 		Insights: insights,
 		Metrics:  metrics,
-	}, nil
+	}
+
+	// Store in cache
+	s.cache.Set(cacheKey, response, cache.DefaultExpiration)
+
+	return response, nil
 }
 
 func (s *InsightsService) getFeedbackGroups(lob, category, folder string) (map[string][]models.Feedback, error) {

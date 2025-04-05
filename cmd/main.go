@@ -3,17 +3,22 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"rabbithole/db"
+	"rabbithole/feed"
+	"rabbithole/insights"
 	"rabbithole/models"
 	"rabbithole/predictions"
 	"rabbithole/scripts/fetchdata"
-	"rabbithole/insights"
 	"rabbithole/scripts/linear"
 	"rabbithole/scripts/roadmap_generator"
 	"rabbithole/scripts/ticket_intelligence"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -27,6 +32,7 @@ type FeedbackService struct {
 	linearSvc    *linear.LinearService
 	roadmapSvc   *roadmap_generator.RoadmapService
 	predictorSvc *predictions.Predictor
+	feedSvc      *feed.FeedService
 }
 
 // NewFeedbackService initializes all required services
@@ -61,6 +67,11 @@ func NewFeedbackService(db *gorm.DB) (*FeedbackService, error) {
 		return nil, fmt.Errorf("failed to create predictor service: %w", err)
 	}
 
+	feedSvc, err := feed.NewFeedService(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create feed service: %w", err)
+	}
+
 	return &FeedbackService{
 		db:           db,
 		ticketSvc:    ticketSvc,
@@ -69,6 +80,7 @@ func NewFeedbackService(db *gorm.DB) (*FeedbackService, error) {
 		linearSvc:    linearSvc,
 		roadmapSvc:   roadmapSvc,
 		predictorSvc: predictorSvc,
+		feedSvc:      feedSvc,
 	}, nil
 }
 
@@ -96,6 +108,17 @@ func main() {
 
 	// Initialize Gin router
 	r := gin.Default()
+
+	// Configure CORS middleware
+	config := cors.Config{
+		AllowOrigins:     []string{"*"}, // Allow all origins
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
+	r.Use(cors.New(config))
 
 	// Register routes
 	v1 := r.Group("/api/v1")
@@ -254,6 +277,40 @@ func main() {
 			c.JSON(http.StatusOK, gin.H{
 				"message":     "Successfully processed feedback",
 				"feedback_id": feedback.ID,
+			})
+		})
+
+		// Add new feed endpoint
+		v1.GET("/feed", func(c *gin.Context) {
+			page := 1
+			pageSize := 10
+
+			// Parse pagination parameters
+			if p := c.Query("page"); p != "" {
+				if val, err := strconv.Atoi(p); err == nil && val > 0 {
+					page = val
+				}
+			}
+			if ps := c.Query("page_size"); ps != "" {
+				if val, err := strconv.Atoi(ps); err == nil && val > 0 {
+					pageSize = val
+				}
+			}
+
+			feedbacks, total, err := feedbackService.feedSvc.GetAllFeedback(c.Request.Context(), page, pageSize)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"data": feedbacks,
+				"meta": gin.H{
+					"total":     total,
+					"page":      page,
+					"page_size": pageSize,
+					"pages":     int(math.Ceil(float64(total) / float64(pageSize))),
+				},
 			})
 		})
 	}
